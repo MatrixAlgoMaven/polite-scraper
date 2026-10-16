@@ -2,12 +2,15 @@
 from pathlib import Path
 import time
 
+from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
+from datetime import datetime, timezone
 
 BASE_URL = "https://books.toscrape.com/"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = PROJECT_ROOT / "cache"
+BOOK_CACHE_DIR = CACHE_DIR / "books"
 
 HEADERS = {
     "User-Agent": (
@@ -83,6 +86,66 @@ def discover_catalogue_pages() -> None:
 
     print("Catalogue discovery complete: checked pages 1–3.")
 
+def discover_book_urls() -> list[dict]:
+    all_books = []
+
+    for page_number in range(1, 4):
+        cache_file = CACHE_DIR / f"catalogue-page-{page_number}.html"
+        html = cache_file.read_text(encoding="utf-8")
+        soup = BeautifulSoup(html, "html.parser")
+
+        for book in soup.select("article.product_pod h3 a[href]"):
+            product_url = urljoin(BASE_URL, book["href"])
+
+            all_books.append({
+                "product_url": product_url,
+                "source_page": page_number,
+            })
+
+    return all_books
+
+def fetch_book_page(product_url: str) -> str:
+    book_slug = product_url.rstrip("/").split("/")[-2]
+    cache_file = BOOK_CACHE_DIR / f"{book_slug}.html"
+
+    return fetch_page(product_url, cache_file)
+
+def scrape_one_book(book: dict) -> dict:
+    html = fetch_book_page(book["product_url"])
+
+    return extract_book_fields(
+        html,
+        book["product_url"],
+        book["source_page"],
+    )
+
+def extract_book_fields(html: str, product_url: str, source_page: int) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = soup.select_one("div.product_main h1")
+    price = soup.select_one("p.price_color")
+    availability = soup.select_one("p.availability")
+    rating = soup.select_one("p.star-rating")
+    description = soup.select_one("#product_description + p")
+
+    return {
+        "title": title.get_text(" ", strip=True) if title else None,
+        "product_url": product_url,
+        "price_text": price.get_text(" ", strip=True) if price else None,
+        "availability_text": (
+            availability.get_text(" ", strip=True) if availability else None
+        ),
+        "rating_text": (
+            rating.get("class", [])[-1]
+            if rating and len(rating.get("class", [])) > 1
+            else None
+        ),
+        "description": (
+            description.get_text(" ", strip=True) if description else None
+        ),
+        "source_page": source_page,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 if __name__ == "__main__":
     discover_catalogue_pages()
