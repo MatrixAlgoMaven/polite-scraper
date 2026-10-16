@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Scraper cache — do not upload downloaded HTML
+cache/
+
+# Environment and editor files
+.env
+.vscode/
