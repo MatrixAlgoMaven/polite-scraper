@@ -7,6 +7,9 @@ venv/
 # Scraper cache — do not upload downloaded HTML
 cache/
 
+# Generated scraper output
+output/
+
 # Environment and editor files
 .env
 .vscode/
