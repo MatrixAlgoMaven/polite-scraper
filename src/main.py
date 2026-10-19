@@ -1,19 +1,27 @@
-import json
-from pathlib import Path
-import time
 
-from src.models import Book
-from urllib.parse import urljoin
+import json
+import re
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, timezone
-from requests.exceptions import Timeout, HTTPError
+from requests.exceptions import HTTPError, Timeout
+
+from src.models import Book
+
 
 BASE_URL = "https://books.toscrape.com/"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = PROJECT_ROOT / "cache"
 BOOK_CACHE_DIR = CACHE_DIR / "books"
-REPORT_FILE = PROJECT_ROOT / "output" / "run-report.json"
+OUTPUT_DIR = PROJECT_ROOT / "output"
+
+BOOKS_FILE = OUTPUT_DIR / "books.json"
+ERRORS_FILE = OUTPUT_DIR / "errors.json"
+REPORT_FILE = OUTPUT_DIR / "run-report.json"
 
 HEADERS = {
     "User-Agent": (
@@ -21,6 +29,7 @@ HEADERS = {
         "(educational project; https://github.com/MatrixAlgoMaven)"
     )
 }
+
 TIMEOUT = 10
 MIN_REQUEST_INTERVAL = 0.5
 MAX_RETRIES = 1
@@ -32,21 +41,19 @@ pages_fetched = 0
 failed_pages = []
 
 
-
 def fetch_page(url: str, cache_file: Path) -> str:
+    """Read cached HTML or download and cache a page politely."""
     global last_request_time, cache_hits, pages_fetched
 
     if cache_file.exists():
         cache_hits += 1
-        html = cache_file.read_text(encoding="utf-8")
         print(f"CACHE HIT: {cache_file.name}")
-        return html
+        return cache_file.read_text(encoding="utf-8")
 
     for attempt in range(MAX_RETRIES + 1):
         if last_request_time is not None:
             elapsed = time.monotonic() - last_request_time
             remaining = MIN_REQUEST_INTERVAL - elapsed
-
             if remaining > 0:
                 time.sleep(remaining)
 
@@ -61,15 +68,14 @@ def fetch_page(url: str, cache_file: Path) -> str:
             print(f"HTTP {response.status_code}: {url}")
             response.raise_for_status()
 
-            pages_fetched += 1
-            response.encoding = "utf-8"
+            # Requests detects the response encoding; use its decoded text.
             html = response.text
 
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             cache_file.write_text(html, encoding="utf-8")
-            print(f"CACHED: {cache_file.name}")
+            pages_fetched += 1
 
+            print(f"CACHED: {cache_file.name}")
             return html
 
         except Timeout:
@@ -80,10 +86,10 @@ def fetch_page(url: str, cache_file: Path) -> str:
                 raise
 
         except HTTPError as error:
-            status_code = error.response.status_code
+            status = error.response.status_code if error.response else 0
 
-            if status_code >= 500 and attempt < MAX_RETRIES:
-                print(f"HTTP {status_code}. Retrying once: {url}")
+            if status >= 500 and attempt < MAX_RETRIES:
+                print(f"HTTP {status}. Retrying once: {url}")
                 time.sleep(RETRY_DELAY)
             else:
                 raise
@@ -91,35 +97,31 @@ def fetch_page(url: str, cache_file: Path) -> str:
     raise RuntimeError(f"Failed to fetch URL after retries: {url}")
 
 
+def catalogue_url(page_number: int) -> str:
+    """Return the URL for one of the first three catalogue pages."""
+    if page_number == 1:
+        return BASE_URL
+    return urljoin(BASE_URL, f"catalogue/page-{page_number}.html")
 
 
 def discover_catalogue_pages() -> None:
-    page_urls = [
-        (BASE_URL, CACHE_DIR / "catalogue-page-1.html"),
-    ]
-
+    """Fetch/cache catalogue pages and verify their listings."""
     for page_number in range(1, 4):
-        if page_number == 1:
-            url, cache_file = page_urls[0]
-        else:
-            url = f"{BASE_URL}catalogue/page-{page_number}.html"
-            cache_file = CACHE_DIR / f"catalogue-page-{page_number}.html"
+        url = catalogue_url(page_number)
+        cache_file = CACHE_DIR / f"catalogue-page-{page_number}.html"
 
         try:
             html = fetch_page(url, cache_file)
             soup = BeautifulSoup(html, "html.parser")
             books = soup.select("article.product_pod")
 
+            if len(books) != 20:
+                raise ValueError(
+                    f"Expected 20 listings on page {page_number}, "
+                    f"found {len(books)}"
+                )
+
             print(f"Page {page_number}: {len(books)} book listings")
-
-            if page_number < 3:
-                next_link = soup.select_one("li.next a")
-                if next_link is None:
-                    raise ValueError(
-                        f"Page {page_number} has no next-page link"
-                    )
-
-                print(f"Next-page link: {next_link.get('href')}")
 
         except Exception as error:
             failed_pages.append({
@@ -127,106 +129,51 @@ def discover_catalogue_pages() -> None:
                 "source_page": page_number,
                 "reason": str(error),
             })
-            print(f"CATALOGUE PAGE FAILED: {url} — {error}")
             raise
 
-    print("Catalogue discovery complete: checked pages 1–3.")
 
 def discover_book_urls() -> list[dict]:
-    all_books = []
+    """Discover unique product URLs from the three cached catalogues."""
+    discovered = {}
 
     for page_number in range(1, 4):
         cache_file = CACHE_DIR / f"catalogue-page-{page_number}.html"
         html = cache_file.read_text(encoding="utf-8")
         soup = BeautifulSoup(html, "html.parser")
+        page_url = catalogue_url(page_number)
 
-        for book in soup.select("article.product_pod h3 a[href]"):
-            if page_number == 1:
-                catalogue_url = BASE_URL
-            else:
-                catalogue_url = f"{BASE_URL}catalogue/page-{page_number}.html"
-
-            product_url = urljoin(catalogue_url, book["href"])
-
-            all_books.append({
+        for link in soup.select("article.product_pod h3 a[href]"):
+            product_url = urljoin(page_url, link["href"])
+            discovered.setdefault(product_url, {
                 "product_url": product_url,
                 "source_page": page_number,
             })
 
-    return all_books
+    books = list(discovered.values())
+
+    if len(books) != 60:
+        raise ValueError(
+            f"Expected 60 unique books, discovered {len(books)}"
+        )
+
+    return books
+
 
 def fetch_book_page(product_url: str) -> str:
-    book_slug = product_url.rstrip("/").split("/")[-2]
-    cache_file = BOOK_CACHE_DIR / f"{book_slug}.html"
+    """Fetch/cache a product page using a stable filename."""
+    path_parts = urlparse(product_url).path.rstrip("/").split("/")
+    slug = path_parts[-2] if len(path_parts) >= 2 else path_parts[-1]
 
+    cache_file = BOOK_CACHE_DIR / f"{slug}.html"
     return fetch_page(product_url, cache_file)
 
-def scrape_one_book(book: dict) -> dict:
-    html = fetch_book_page(book["product_url"])
 
-    return extract_book_fields(
-        html,
-        book["product_url"],
-        book["source_page"],
-    )
-
-
-def scrape_all_books() -> list[dict]:
-    books = discover_book_urls()
-    scraped_books = []
-
-    for index, book in enumerate(books, start=1):
-        print(f"Scraping book {index}/{len(books)}: {book['product_url']}")
-
-        try:
-            scraped_book = scrape_one_book(book)
-            scraped_books.append(scraped_book)
-        except Exception as error:
-            print(f"FAILED: {book['product_url']} — {error}")
-            failed_pages.append({
-                "url": book["product_url"],
-                "source_page": book["source_page"],
-                "reason": str(error),
-            })
-            scraped_books.append({
-                "_scrape_error": str(error),
-                "product_url": book["product_url"],
-                "source_page": book["source_page"],
-            })
-
-    print(
-        f"Scraping complete: "
-        f"{sum('_scrape_error' not in book for book in scraped_books)}/"
-        f"{len(books)} books extracted."
-    )
-    return scraped_books
-
-
-def save_books(books: list[dict]) -> None:
-    output_dir = PROJECT_ROOT / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    output_file = output_dir / "books.json"
-
-    with output_file.open("w", encoding="utf-8") as file:
-        json.dump(books, file, indent=2, ensure_ascii=False)
-
-    print(f"Saved {len(books)} books to {output_file}")
-
-
-def save_errors(errors: list[dict]) -> None:
-    output_dir = PROJECT_ROOT / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    output_file = output_dir / "errors.json"
-
-    with output_file.open("w", encoding="utf-8") as file:
-        json.dump(errors, file, indent=2, ensure_ascii=False)
-
-    print(f"Saved {len(errors)} errors to {output_file}")
-
-
-def extract_book_fields(html: str, product_url: str, source_page: int) -> dict:
+def extract_book_fields(
+    html: str,
+    product_url: str,
+    source_page: int,
+) -> dict:
+    """Extract raw fields and normalize the book price."""
     soup = BeautifulSoup(html, "html.parser")
 
     title = soup.select_one("div.product_main h1")
@@ -235,97 +182,171 @@ def extract_book_fields(html: str, product_url: str, source_page: int) -> dict:
     rating = soup.select_one("p.star-rating")
     description = soup.select_one("#product_description + p")
 
+    if not all([title, price, availability, rating, description]):
+        raise ValueError("One or more required product fields are missing")
+
+    # HTML entities are decoded by Beautiful Soup. Remove only currency
+    # characters and surrounding whitespace before converting the price.
+    price_text = price.get_text(" ", strip=True).replace("\xa0", " ").strip()
+    numeric_text = price_text.replace("£", "").strip()
+    numeric_text = numeric_text.replace(",", "")
+
+    if not re.fullmatch(r"\d+(?:\.\d{1,2})?", numeric_text):
+        raise ValueError(f"Could not parse price: {price_text!r}")
+
+    rating_classes = rating.get("class", [])
+    rating_text = next(
+        (item for item in rating_classes if item in {
+            "One", "Two", "Three", "Four", "Five"
+        }),
+        None,
+    )
+
+    if rating_text is None:
+        raise ValueError("Book rating is missing or invalid")
+
     return {
-        "title": title.get_text(" ", strip=True) if title else None,
+        "title": title.get_text(" ", strip=True),
         "product_url": product_url,
-        "price_text": price.get_text(" ", strip=True) if price else None,
-        "price_gbp": (
-            float(price.get_text(" ", strip=True).replace("£", "").strip())
-            if price else None
-        ),
-        "availability_text": (
-            availability.get_text(" ", strip=True) if availability else None
-        ),
-        "rating_text": (
-            rating.get("class", [])[-1]
-            if rating and len(rating.get("class", [])) > 1
-            else None
-        ),
-        "description": (
-            description.get_text(" ", strip=True) if description else None
-        ),
+        "price_text": price_text,
+        "price_gbp": float(numeric_text),
+        "availability_text": availability.get_text(" ", strip=True),
+        "rating_text": rating_text,
+        "description": description.get_text(" ", strip=True),
         "source_page": source_page,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
+def scrape_one_book(book: dict) -> dict:
+    html = fetch_book_page(book["product_url"])
+    return extract_book_fields(
+        html,
+        book["product_url"],
+        book["source_page"],
+    )
+
+
+def scrape_all_books() -> list[dict]:
+    """Scrape each discovered book, recording individual failures."""
+    scraped_books = []
+
+    for index, book in enumerate(discover_book_urls(), start=1):
+        url = book["product_url"]
+        print(f"Scraping book {index}/60: {url}")
+
+        try:
+            scraped_books.append(scrape_one_book(book))
+        except Exception as error:
+            failed_pages.append({
+                "url": url,
+                "source_page": book["source_page"],
+                "reason": str(error),
+            })
+            scraped_books.append({
+                "_scrape_error": str(error),
+                "product_url": url,
+                "source_page": book["source_page"],
+            })
+            print(f"FAILED: {url} — {error}")
+
+    return scraped_books
+
+
+def save_json(path: Path, data) -> None:
+    """Write readable UTF-8 JSON without escaping Unicode characters."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("w", encoding="utf-8", newline="\n") as file:
+        json.dump(data, file, indent=2, ensure_ascii=False)
+        file.write("\n")
+
+
+def save_books(books: list[dict]) -> None:
+    save_json(BOOKS_FILE, books)
+    print(f"Saved {len(books)} books to {BOOKS_FILE}")
+
+
+def save_errors(errors: list[dict]) -> None:
+    save_json(ERRORS_FILE, errors)
+    print(f"Saved {len(errors)} errors to {ERRORS_FILE}")
+
+
 def save_run_report(report: dict) -> None:
-    REPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    with REPORT_FILE.open("w", encoding="utf-8") as file:
-        json.dump(report, file, indent=2, ensure_ascii=False)
-
+    save_json(REPORT_FILE, report)
     print(f"Saved run report to {REPORT_FILE}")
 
 
+def main() -> None:
+    global last_request_time, cache_hits, pages_fetched, failed_pages
 
-if __name__ == "__main__":
     run_started_at = datetime.now(timezone.utc)
-    run_succeeded = False
-
-    try:
-        discover_catalogue_pages()
-        books = scrape_all_books()
-        run_succeeded = True
-    except Exception as error:
-        print(f"SCRAPER RUN FAILED: {error}")
-        books = []
+    last_request_time = None
+    cache_hits = 0
+    pages_fetched = 0
+    failed_pages = []
 
     valid_books = []
     errors = []
+    catalogue_ok = False
 
-    for book in books:
-        if "_scrape_error" in book:
-            errors.append({
-                "product_url": book["product_url"],
-                "source_page": book["source_page"],
-                "reason": book["_scrape_error"],
-            })
-            continue
+    try:
+        discover_catalogue_pages()
+        catalogue_ok = True
+        scraped_books = scrape_all_books()
 
-        try:
-            validated_book = Book.model_validate(book)
-            valid_books.append(validated_book.model_dump(mode="json"))
-        except Exception as error:
-            errors.append({
-                "product_url": book.get("product_url"),
-                "source_page": book.get("source_page"),
-                "record": book,
-                "reason": str(error),
-            })
-            print(
-                f"VALIDATION FAILED: "
-                f"{book.get('product_url')} — {error}"
-            )
+        for book in scraped_books:
+            if "_scrape_error" in book:
+                errors.append({
+                    "product_url": book["product_url"],
+                    "source_page": book["source_page"],
+                    "reason": book["_scrape_error"],
+                })
+                continue
 
-    if run_succeeded:
+            try:
+                validated = Book.model_validate(book)
+                valid_books.append(validated.model_dump(mode="json"))
+            except Exception as error:
+                errors.append({
+                    "product_url": book.get("product_url"),
+                    "source_page": book.get("source_page"),
+                    "record": book,
+                    "reason": str(error),
+                })
+
+        # Replace the output files only after catalogue discovery succeeds.
         save_books(valid_books)
         save_errors(errors)
+
+    except Exception as error:
+        print(f"SCRAPER RUN FAILED: {error}")
+        errors.append({
+            "stage": "catalogue",
+            "reason": str(error),
+        })
+        # Preserve the previous books.json and errors.json if catalogue
+        # discovery fails before the scraping stage completes.
+        if not catalogue_ok:
+            print("Keeping previous books.json and errors.json unchanged.")
+        else:
+            save_errors(errors)
+
+    finished_at = datetime.now(timezone.utc)
+    duration = (finished_at - run_started_at).total_seconds()
+
+    if not catalogue_ok:
+        status = "failed"
+    elif errors or failed_pages:
+        status = "partial_failure"
     else:
-        print("Run failed; keeping previous books.json and errors.json unchanged.")
+        status = "success"
 
-    run_finished_at = datetime.now(timezone.utc)
-    duration_seconds = (
-        run_finished_at - run_started_at
-    ).total_seconds()
-
-    print(f"Run duration: {duration_seconds:.2f} seconds")
-
-    run_report = {
-        "status": "success" if run_succeeded else "failed",
+    report = {
+        "status": status,
         "started_at": run_started_at.isoformat(),
-        "finished_at": run_finished_at.isoformat(),
-        "duration_seconds": round(duration_seconds, 2),
+        "finished_at": finished_at.isoformat(),
+        "duration_seconds": round(duration, 2),
         "pages_fetched": pages_fetched,
         "cache_hits": cache_hits,
         "valid_records": len(valid_books),
@@ -333,4 +354,11 @@ if __name__ == "__main__":
         "failed_pages": failed_pages,
     }
 
-    save_run_report(run_report)
+    save_run_report(report)
+    print(f"Run status: {status}")
+    print(f"Valid records: {len(valid_books)}")
+    print(f"Errors: {len(errors)}")
+
+
+if __name__ == "__main__":
+    main()
