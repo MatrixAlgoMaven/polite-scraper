@@ -10,12 +10,12 @@ The project focuses on responsible request handling, caching, data validation, e
 - **Purpose:** Educational web-scraping practice.
 - **Scope:** The first three catalogue pages, covering 60 book listings.
 - **Output:** Structured JSON records validated with Pydantic.
-- **Browser requirement:** A browser automation tool is unnecessary for this static HTML target; Requests and Beautiful Soup are sufficient for the current scope.
+- **Browser requirement:** Browser automation is unnecessary for this static HTML target; Requests and Beautiful Soup are sufficient for the current scope.
 - **Responsible use:** This project is limited to the practice sandbox. Check a site's rules and terms before adapting the scraper for another target.
 
 ### Robots Check
 
-On 16 October 2026, a request to `https://books.toscrape.com/robots.txt` returned HTTP 401 Unauthorized. This records the observed response only; it does not establish the contents of the robots file or imply permission to scrape other sites.
+On 16 October 2026, a request to [https://books.toscrape.com/robots.txt](https://books.toscrape.com/robots.txt) returned HTTP 401 Unauthorized. This records the observed response only; it does not establish the contents of the robots file or imply permission to scrape other sites.
 
 ## Features
 
@@ -82,6 +82,25 @@ python -m src.main
 
 The scraper creates the cache and output directories as needed.
 
+## Running the Tests
+
+Run the automated test suite from the project root:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+The tests cover:
+
+- Price parsing and normalization to numeric GBP.
+- Acceptance of valid book records.
+- Rejection of records with a zero price.
+- Rejection of records with an invalid catalogue page number.
+- Retrying a request after a timeout and successfully caching the response.
+- Avoiding retries after an HTTP 404 response.
+
+The tests use mocked HTTP responses and temporary files. They do not require live network requests or depend on the scraper's cache files.
+
 ## Generated Files
 
 The scraper writes these files under `output/`:
@@ -122,9 +141,11 @@ polite-scraper/
 ├── src/
 │   ├── main.py
 │   └── models.py
+├── tests/
+│   └── test_scraper.py
 ├── requirements.txt
 ├── README.md
 ├── .gitignore
-├── cache/          # Generated, ignored by Git
-└── output/         # Generated, ignored by Git
+├── cache/              # Generated, ignored by Git
+└── output/             # Generated, ignored by Git
 ```
